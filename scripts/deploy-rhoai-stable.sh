@@ -21,13 +21,42 @@
 #   - jq tool for JSON processing
 #
 # USAGE:
-#   ./deploy-rhoai-stable.sh
+#   ./deploy-rhoai-stable.sh [--insecure]
+#
+#   Options:
+#     --insecure    Deploy without TLS (HTTP mode instead of HTTPS)
+#
+#   Environment Variables:
+#     INSECURE_HTTP=true    Deploy without TLS (alternative to --insecure flag)
+#     MAAS_REF              Git ref for MaaS deployment (default: main)
 #
 # NOTES:
 #   - The script is idempotent for most operations
-#   - No arguments are expected
+#   - TLS is enabled by default; use --insecure flag or INSECURE_HTTP=true for HTTP mode
 
 set -e
+
+ENABLE_TLS_BACKEND=1
+
+# Respect INSECURE_HTTP env var (used by test scripts)
+if [[ "${INSECURE_HTTP:-}" == "true" ]]; then
+  ENABLE_TLS_BACKEND=0
+fi
+
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --insecure)
+      ENABLE_TLS_BACKEND=0
+      shift
+      ;;
+    *)
+      echo "Unknown option: $1"
+      echo "Usage: $0 [--insecure]"
+      exit 1
+      ;;
+  esac
+done
 
 waitsubscriptioninstalled() {
   local ns=${1?namespace is required}; shift
@@ -326,13 +355,25 @@ else
 fi
 
 : "${MAAS_REF:=main}"
-kubectl apply --server-side=true \
-  -f <(kustomize build "https://github.com/opendatahub-io/models-as-a-service.git/deployment/overlays/openshift?ref=${MAAS_REF}" | \
+
+# Select overlay and configuration based on TLS mode
+if [[ "$ENABLE_TLS_BACKEND" -eq 1 ]]; then
+  echo "* Deploying MaaS with TLS backend..."
+  OVERLAY="deployment/overlays/openshift"
+  MAAS_NAMESPACE="opendatahub"
+else
+  echo "* Deploying MaaS with HTTP backend (insecure mode)..."
+  OVERLAY="deployment/overlays/http-backend"
+  MAAS_NAMESPACE="maas-api"
+fi
+
+kubectl apply --server-side=true --force-conflicts \
+  -f <(kustomize build "https://github.com/opendatahub-io/models-as-a-service.git/${OVERLAY}?ref=${MAAS_REF}" | \
        envsubst '$CLUSTER_DOMAIN')
 
 if [[ -n "$AUD" && "$AUD" != "https://kubernetes.default.svc"  ]]; then
   echo "* Configuring audience in MaaS AuthPolicy"
-  kubectl patch authpolicy maas-api-auth-policy -n maas-api --type=merge --patch-file <(echo "
+  kubectl patch authpolicy maas-api-auth-policy -n ${MAAS_NAMESPACE} --type=merge --patch-file <(echo "
 spec:
   rules:
     authentication:
@@ -343,9 +384,24 @@ spec:
             - maas-default-gateway-sa")
 fi
 
-# Patch maas-api Deployment with stable image
-: "${MAAS_RHOAI_IMAGE:=v3.0.0}"
-kubectl set image -n maas-api deployment/maas-api maas-api=registry.redhat.io/rhoai/odh-maas-api-rhel9:${MAAS_RHOAI_IMAGE}
+# Image configuration based on TLS mode
+if [[ "$ENABLE_TLS_BACKEND" -eq 0 ]]; then
+  # HTTP mode: RHOAI stable image works (listens on port 8080)
+  echo "* Waiting for maas-api deployment to be created..."
+  for i in {1..30}; do
+    if kubectl get deployment maas-api -n ${MAAS_NAMESPACE} >/dev/null 2>&1; then
+      break
+    fi
+    sleep 2
+  done
+  
+  : "${MAAS_RHOAI_IMAGE:=v3.0.0}"
+  echo "* Configuring RHOAI stable image: ${MAAS_RHOAI_IMAGE}"
+  kubectl set image -n ${MAAS_NAMESPACE} deployment/maas-api maas-api=registry.redhat.io/rhoai/odh-maas-api-rhel9:${MAAS_RHOAI_IMAGE}
+else
+  # TLS mode: Use upstream image (RHOAI stable images have TLS compatibility issues)
+  echo "* Using upstream image (quay.io/opendatahub/maas-api:latest) for TLS mode"
+fi
 
 echo ""
 echo "========================================="
