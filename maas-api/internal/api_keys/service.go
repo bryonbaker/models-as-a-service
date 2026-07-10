@@ -84,6 +84,7 @@ type CreateAPIKeyResponse struct {
 	CreatedAt    string  `json:"createdAt"`
 	ExpiresAt    *string `json:"expiresAt,omitempty"` // RFC3339 timestamp
 	Ephemeral    bool    `json:"ephemeral"`           // Short-lived programmatic key
+	Labels       map[string]string `json:"labels,omitempty"` // Structured key-value pairs for API key metadata
 }
 
 // CreateAPIKey creates a new API key (sk-oai-* format).
@@ -96,7 +97,7 @@ type CreateAPIKeyResponse struct {
 // Admins can create keys for other users by specifying a different username.
 func (s *Service) CreateAPIKey(
 	ctx context.Context, username string, userGroups []string, name, description string,
-	expiresIn *time.Duration, ephemeral bool, requestedSubscription string, tenant string,
+	expiresIn *time.Duration, ephemeral bool, requestedSubscription string, tenant string, labels map[string]string,
 ) (*CreateAPIKeyResponse, error) {
 	// Validate group names against allowlist pattern (CWE-116/CWE-74 mitigation).
 	// AuthPolicy uses CEL to build JSON arrays from groups, and CEL lacks JSON escaping
@@ -174,11 +175,11 @@ func (s *Service) CreateAPIKey(
 	// Note: prefix is NOT stored (security - reduces brute-force attack surface)
 	// userGroups stored as PostgreSQL TEXT[] array (no JSON marshaling needed)
 	// Hash is SHA-256(key_id + secret) where key_id is embedded in the API key as per-key salt
-	if err := s.store.AddKey(ctx, username, keyID, hash, name, description, userGroups, subscriptionName, tenant, &expiresAt, ephemeral); err != nil {
+	if err := s.store.AddKey(ctx, username, keyID, hash, name, description, userGroups, subscriptionName, tenant, &expiresAt, ephemeral, labels); err != nil {
 		return nil, fmt.Errorf("failed to store API key: %w", err)
 	}
 
-	s.logger.Info("Created API key", "user", username, "groups", userGroups, "id", keyID, "ephemeral", ephemeral)
+	s.logger.Info("Created API key", "user", username, "groups", userGroups, "id", keyID, "ephemeral", ephemeral, "hasLabels", len(labels) > 0)
 
 	// Return plaintext to user - THIS IS THE ONLY TIME IT'S AVAILABLE
 	formatted := expiresAt.Format(time.RFC3339)
@@ -191,6 +192,7 @@ func (s *Service) CreateAPIKey(
 		CreatedAt:    time.Now().UTC().Format(time.RFC3339),
 		ExpiresAt:    &formatted,
 		Ephemeral:    ephemeral,
+		Labels:       labels,
 	}
 
 	return response, nil
