@@ -323,7 +323,8 @@ func TestSearchAPIKeys_StatusFilter(t *testing.T) {
 	// Create active and revoked keys
 	err := store.AddKey(ctx, testUser.Username, "active-key", "active-hash", "Active Key", "", []string{"system:authenticated"}, testSubscriptionName, "test-tenant", nil, false, nil)
 	require.NoError(t, err)
-	err = store.AddKey(ctx, testUser.Username, "revoked-key", "revoked-hash", "Revoked Key", "", []string{"system:authenticated"}, testSubscriptionName, "test-tenant", nil, false, nil)
+	err = store.AddKey(ctx, testUser.Username, "revoked-key", "revoked-hash", "Revoked Key", "", []string{"system:authenticated"}, testSubscriptionName, 
+		"test-tenant", nil, false, nil)
 	require.NoError(t, err)
 	err = store.Revoke(ctx, "revoked-key")
 	require.NoError(t, err)
@@ -1571,7 +1572,8 @@ func TestCleanupExpiredEphemeralKeys(t *testing.T) {
 
 	// Create expired ephemeral key within 30-minute grace period (should NOT be deleted)
 	recentExpiry := time.Now().Add(-10 * time.Minute)
-	err = store.AddKey(ctx, "alice", "recently-expired-ephemeral", "hash-5", "Recently Expired Ephemeral", "", []string{"users"}, testSubscriptionName, "test-tenant", &recentExpiry, true, nil)
+	err = store.AddKey(ctx, "alice", "recently-expired-ephemeral", "hash-5", "Recently Expired Ephemeral", "", []string{"users"}, testSubscriptionName, 
+		"test-tenant", &recentExpiry, true, nil)
 	require.NoError(t, err)
 
 	t.Run("DeletesExpiredEphemeralKeys", func(t *testing.T) {
@@ -1641,9 +1643,11 @@ func TestSearchExcludesEphemeralByDefault(t *testing.T) {
 
 	// Create ephemeral keys
 	futureExpiry := time.Now().Add(1 * time.Hour)
-	err = store.AddKey(ctx, testUser.Username, "ephemeral-key-1", "hash-3", "Ephemeral Key 1", "", []string{"system:authenticated"}, testSubscriptionName, "test-tenant", &futureExpiry, true, nil)
+	err = store.AddKey(ctx, testUser.Username, "ephemeral-key-1", "hash-3", "Ephemeral Key 1", "", []string{"system:authenticated"}, testSubscriptionName, 
+		"test-tenant", &futureExpiry, true, nil)
 	require.NoError(t, err)
-	err = store.AddKey(ctx, testUser.Username, "ephemeral-key-2", "hash-4", "Ephemeral Key 2", "", []string{"system:authenticated"}, testSubscriptionName, "test-tenant", &futureExpiry, true, nil)
+	err = store.AddKey(ctx, testUser.Username, "ephemeral-key-2", "hash-4", "Ephemeral Key 2", "", []string{"system:authenticated"}, testSubscriptionName, 
+		"test-tenant", &futureExpiry, true, nil)
 	require.NoError(t, err)
 
 	t.Run("DefaultSearchExcludesEphemeral", func(t *testing.T) {
@@ -1690,16 +1694,19 @@ func TestSearchAPIKeys_ExpiredStatusComputation(t *testing.T) {
 
 	// Create a key that expired yesterday (stored as active, but past expiration)
 	pastExpiry := time.Now().Add(-24 * time.Hour)
-	err := store.AddKey(ctx, testUser.Username, "expired-key", "expired-hash", "Expired Key", "", []string{"system:authenticated"}, testSubscriptionName, "test-tenant", &pastExpiry, false, nil)
+	err := store.AddKey(ctx, testUser.Username, "expired-key", "expired-hash", "Expired Key", "", []string{"system:authenticated"}, testSubscriptionName, 
+		"test-tenant", &pastExpiry, false, nil)
 	require.NoError(t, err)
 
 	// Create an active key with future expiration
 	futureExpiry := time.Now().Add(24 * time.Hour)
-	err = store.AddKey(ctx, testUser.Username, "active-key", "active-hash", "Active Key","", []string{"system:authenticated"}, testSubscriptionName, "test-tenant", &futureExpiry, false, nil)
+	err = store.AddKey(ctx, testUser.Username, "active-key", "active-hash", "Active Key","", []string{"system:authenticated"}, testSubscriptionName, 
+		"test-tenant", &futureExpiry, false, nil)
 	require.NoError(t, err)
 
 	// Create an active key with no expiration
-	err = store.AddKey(ctx, testUser.Username, "permanent-key", "permanent-hash", "Permanent Key", "", []string{"system:authenticated"}, testSubscriptionName, "test-tenant", nil, false, nil)
+	err = store.AddKey(ctx, testUser.Username, "permanent-key", "permanent-hash", "Permanent Key", "", []string{"system:authenticated"}, testSubscriptionName, 
+		"test-tenant", nil, false, nil)
 	require.NoError(t, err)
 
 	t.Run("SearchReturnsExpiredStatusForPastExpirationKeys", func(t *testing.T) {
@@ -1752,12 +1759,14 @@ func TestGetAPIKey_ExpiredStatusComputation(t *testing.T) {
 
 	// Create a key that expired yesterday
 	pastExpiry := time.Now().Add(-24 * time.Hour)
-	err := store.AddKey(ctx, testUser.Username, "expired-key", "expired-hash", "Expired Key", "", []string{"system:authenticated"}, testSubscriptionName, "test-tenant", &pastExpiry, false, nil)
+	err := store.AddKey(ctx, testUser.Username, "expired-key", "expired-hash", "Expired Key", "", []string{"system:authenticated"}, testSubscriptionName, 
+		"test-tenant", &pastExpiry, false, nil)
 	require.NoError(t, err)
 
 	// Create an active key with future expiration
 	futureExpiry := time.Now().Add(24 * time.Hour)
-	err = store.AddKey(ctx, testUser.Username, "active-key", "active-hash", "Active Key", "", []string{"system:authenticated"}, testSubscriptionName, "test-tenant", &futureExpiry, false, nil)
+	err = store.AddKey(ctx, testUser.Username, "active-key", "active-hash", "Active Key", "", []string{"system:authenticated"}, testSubscriptionName, 
+		"test-tenant", &futureExpiry, false, nil)
 	require.NoError(t, err)
 
 	t.Run("GetExpiredKeyReturnsExpiredStatus", func(t *testing.T) {
@@ -2350,7 +2359,7 @@ func TestValidateLabels_Errors(t *testing.T) {
 // Helper function to create a map with a specific number of entries.
 func makeLargeLabels(count int) map[string]string {
 	labels := make(map[string]string)
-	for i := 0; i < count; i++ {
+	for i := range count {
 		labels[fmt.Sprintf("key_%d", i)] = fmt.Sprintf("value_%d", i)
 	}
 	return labels
@@ -2455,7 +2464,7 @@ func TestCreateAPIKey_InvalidLabels(t *testing.T) {
 	}{
 		{
 			name:       "too many labels",
-			labelsJSON: makeLargeLabelsJSON(51),
+			labelsJSON: makeLargeLabelsJSON(t, constant.MaxLabelsEntries+1),
 			wantStatus: http.StatusBadRequest,
 			wantErr:    "cannot exceed 50",
 		},
@@ -2467,9 +2476,9 @@ func TestCreateAPIKey_InvalidLabels(t *testing.T) {
 		},
 		{
 			name:       "key too long",
-			labelsJSON: fmt.Sprintf(`{"%s": "value"}`, strings.Repeat("a", 129)),
+			labelsJSON: fmt.Sprintf(`{"%s": "value"}`, strings.Repeat("a", constant.MaxLabelKeyLength+1)),
 			wantStatus: http.StatusBadRequest,
-			wantErr:    "exceeds 128 characters",
+			wantErr:    fmt.Sprintf("exceeds %d characters", constant.MaxLabelKeyLength),
 		},
 	}
 
@@ -2495,7 +2504,7 @@ func TestCreateAPIKey_InvalidLabels(t *testing.T) {
 
 			assert.Equal(t, tt.wantStatus, w.Code)
 			
-			var errResp map[string]interface{}
+			var errResp map[string]any
 			err := json.Unmarshal(w.Body.Bytes(), &errResp)
 			require.NoError(t, err)
 			assert.Contains(t, errResp["error"], tt.wantErr)
@@ -2504,9 +2513,11 @@ func TestCreateAPIKey_InvalidLabels(t *testing.T) {
 }
 
 // Helper to generate JSON for large labels map.
-func makeLargeLabelsJSON(count int) string {
+func makeLargeLabelsJSON(t *testing.T, count int) string {
+	t.Helper()
 	labels := makeLargeLabels(count)
-	bytes, _ := json.Marshal(labels)
+	bytes, err := json.Marshal(labels)
+	require.NoError(t, err)
 	return string(bytes)
 }
 
