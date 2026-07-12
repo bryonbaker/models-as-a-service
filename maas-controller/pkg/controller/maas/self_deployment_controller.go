@@ -51,7 +51,7 @@ const CleanupFinalizer = "maas.opendatahub.io/cleanup"
 // LifecycleReconciler watches the maas-controller Deployment. It is the sole creator of the
 // cluster-scoped Config/default anchor when the Deployment exists and is not terminating (so
 // standalone installs do not race applying a Config manifest before the Config CRD is ready).
-// It links the Deployment, default AITenant, and default Tenant to Config via non-controller
+// It links the Deployment, default AITenant, and default MaasTenantConfig to Config via non-controller
 // ownerReferences (same relationship shape for all). Legacy CleanupFinalizer entries are removed when present.
 type LifecycleReconciler struct {
 	client.Client
@@ -67,7 +67,7 @@ type LifecycleReconciler struct {
 //+kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;update;patch
 //+kubebuilder:rbac:groups=apps,resources=deployments/finalizers,verbs=update
 //+kubebuilder:rbac:groups=maas.opendatahub.io,resources=configs,verbs=get;list;watch
-//+kubebuilder:rbac:groups=maas.opendatahub.io,resources=tenants,verbs=get;list;watch;update;patch
+//+kubebuilder:rbac:groups=maas.opendatahub.io,resources=maastenantconfigs,verbs=get;list;watch;update;patch
 //+kubebuilder:rbac:groups=maas.opendatahub.io,resources=aitenants,verbs=get;list;watch;update;patch
 //+kubebuilder:rbac:groups=perses.dev,resources=persesdashboards;persesdatasources,verbs=get;list;watch;create;patch;delete
 
@@ -100,10 +100,7 @@ func (r *LifecycleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		} else if res != nil {
 			return *res, nil
 		}
-		if err := r.ensureLimitadorServiceMonitor(ctx); err != nil {
-			return ctrl.Result{}, err
-		}
-		if err := r.ensureObservabilityDashboards(ctx, log); err != nil {
+		if err := r.ensureObservability(ctx, log); err != nil {
 			return ctrl.Result{}, err
 		}
 		if err := r.stripLegacyCleanupFinalizer(ctx, log, req.NamespacedName); err != nil {
@@ -285,8 +282,8 @@ func (r *LifecycleReconciler) ensureDeploymentReferencesConfig(ctx context.Conte
 	return nil, nil
 }
 
-// ensureTenantReferencesConfig links default-tenant to Config/default via the same non-controller
-// ownerReference pattern as the Deployment. The cluster bootstrap runnable may create the Tenant
+// ensureTenantReferencesConfig links MaasTenantConfig/default-tenant to Config/default via the same non-controller
+// ownerReference pattern as the Deployment. The cluster bootstrap runnable may create the config
 // shell without owner refs; this reconciler converges them once Config has a UID.
 func (r *LifecycleReconciler) ensureTenantReferencesConfig(ctx context.Context) (*ctrl.Result, error) {
 	if r.TenantSubscriptionNamespace == "" {
@@ -300,14 +297,14 @@ func (r *LifecycleReconciler) ensureTenantReferencesConfig(ctx context.Context) 
 	var cfg maasv1alpha1.Config
 	if err := r.Get(ctx, cfgKey, &cfg); err != nil {
 		if apierrors.IsNotFound(err) {
-			log.Info("Config anchor not found when linking Tenant; requeueing")
+			log.Info("Config anchor not found when linking MaasTenantConfig; requeueing")
 			res := ctrl.Result{RequeueAfter: 2 * time.Second}
 			return &res, nil
 		}
 		return nil, err
 	}
 	if !cfg.DeletionTimestamp.IsZero() {
-		log.Info("Config anchor is terminating when linking Tenant; requeueing")
+		log.Info("Config anchor is terminating when linking MaasTenantConfig; requeueing")
 		res := ctrl.Result{RequeueAfter: 10 * time.Second}
 		return &res, nil
 	}
@@ -315,8 +312,8 @@ func (r *LifecycleReconciler) ensureTenantReferencesConfig(ctx context.Context) 
 		res := ctrl.Result{RequeueAfter: 2 * time.Second}
 		return &res, nil
 	}
-	tKey := client.ObjectKey{Name: maasv1alpha1.TenantInstanceName, Namespace: r.TenantSubscriptionNamespace}
-	var tenant maasv1alpha1.Tenant
+	tKey := client.ObjectKey{Name: maasv1alpha1.MaasTenantConfigInstanceName, Namespace: r.TenantSubscriptionNamespace}
+	var tenant maasv1alpha1.MaasTenantConfig
 	if err := r.Get(ctx, tKey, &tenant); err != nil {
 		if apierrors.IsNotFound(err) {
 			return nil, nil
@@ -328,16 +325,16 @@ func (r *LifecycleReconciler) ensureTenantReferencesConfig(ctx context.Context) 
 	}
 	base := tenant.DeepCopy()
 	if err := controllerutil.SetOwnerReference(&cfg, &tenant, r.Scheme); err != nil {
-		return nil, fmt.Errorf("set Config owner reference on tenant: %w", err)
+		return nil, fmt.Errorf("set Config owner reference on MaasTenantConfig: %w", err)
 	}
 	if err := r.Patch(ctx, &tenant, client.MergeFrom(base)); err != nil {
-		return nil, fmt.Errorf("patch tenant ownerReferences: %w", err)
+		return nil, fmt.Errorf("patch MaasTenantConfig ownerReferences: %w", err)
 	}
-	log.Info("set Config owner reference on default-tenant", "namespace", r.TenantSubscriptionNamespace)
+	log.Info("set Config owner reference on MaasTenantConfig/default-tenant", "namespace", r.TenantSubscriptionNamespace)
 	return nil, nil
 }
 
-func tenantReferencesConfig(tenant *maasv1alpha1.Tenant, ct *maasv1alpha1.Config) bool {
+func tenantReferencesConfig(tenant *maasv1alpha1.MaasTenantConfig, ct *maasv1alpha1.Config) bool {
 	for _, ref := range tenant.OwnerReferences {
 		if ref.UID == ct.UID &&
 			ref.Kind == maasv1alpha1.ConfigKind &&
@@ -359,9 +356,18 @@ func aitenantReferencesConfig(aitenant *maasv1alpha1.AITenant, ct *maasv1alpha1.
 	return false
 }
 
+func (r *LifecycleReconciler) ensureObservability(ctx context.Context, log logr.Logger) error {
+	if err := r.ensureLimitadorServiceMonitor(ctx); err != nil {
+		return err
+	}
+	if err := r.ensureUsageDashboard(ctx, log); err != nil {
+		return err
+	}
+	return nil
+}
+
 // ensureLimitadorServiceMonitor creates or updates the Limitador ServiceMonitor in the operator namespace.
 // This ServiceMonitor ensures metrics are scraped from the Limitador pod and get to the DSC's monitoring stack.
-// TODO: move the ServiceMonitor to the monitoring namespace (opendatahub/redahat-ods-monitoring).
 // If the ServiceMonitor CRD is not available, this is a no-op (allows running without the monitoring stack).
 // TODO: need to set the overall status of MaaS to Degraded if COO is missing.
 func (r *LifecycleReconciler) ensureLimitadorServiceMonitor(ctx context.Context) error {
@@ -373,13 +379,18 @@ func (r *LifecycleReconciler) ensureLimitadorServiceMonitor(ctx context.Context)
 		return err
 	}
 
+	scrapeInterval := cfg.Spec.LimitadorScrapeInterval
+	if scrapeInterval == "" {
+		scrapeInterval = "30s"
+	}
+
 	sm := &unstructured.Unstructured{
 		Object: map[string]any{
 			"apiVersion": "monitoring.coreos.com/v1",
 			"kind":       "ServiceMonitor",
 			"metadata": map[string]any{
 				"name":      "limitador-metrics",
-				"namespace": r.DeploymentNS,
+				"namespace": r.MonitoringNamespace,
 				"labels": map[string]any{
 					"app":                              "limitador",
 					"monitoring.opendatahub.io/scrape": "true",
@@ -388,7 +399,7 @@ func (r *LifecycleReconciler) ensureLimitadorServiceMonitor(ctx context.Context)
 			"spec": map[string]any{
 				"endpoints": []any{
 					map[string]any{
-						"interval": "30s",
+						"interval": scrapeInterval,
 						"path":     "/metrics",
 						"port":     "http",
 					},
@@ -420,11 +431,10 @@ func (r *LifecycleReconciler) ensureLimitadorServiceMonitor(ctx context.Context)
 	return nil
 }
 
-// ensureObservabilityDashboards creates the usage dashboard and its dependencies
-// (ConfigMap, PersesDatasource, PersesDashboard) in the monitoring namespace.
+// ensureUsageDashboard creates the usage dashboard in the monitoring namespace.
 // Uses the existing kustomize infrastructure to render manifests from ObservabilityManifestsPath.
 // If ObservabilityManifestsPath is not set or Perses CRDs are not installed, gracefully skips.
-func (r *LifecycleReconciler) ensureObservabilityDashboards(ctx context.Context, log logr.Logger) error {
+func (r *LifecycleReconciler) ensureUsageDashboard(ctx context.Context, log logr.Logger) error {
 	// Skip if observability manifests path not configured
 	if r.ObservabilityManifestsPath == "" {
 		log.Info("WARNING: Observability manifests path not configured; skipping observability dashboards")
@@ -483,7 +493,7 @@ func (r *LifecycleReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		if r.TenantSubscriptionNamespace == "" {
 			return false
 		}
-		return o.GetNamespace() == r.TenantSubscriptionNamespace && o.GetName() == maasv1alpha1.TenantInstanceName
+		return o.GetNamespace() == r.TenantSubscriptionNamespace && o.GetName() == maasv1alpha1.MaasTenantConfigInstanceName
 	})
 	defaultAITenant := predicate.NewPredicateFuncs(func(o client.Object) bool {
 		if r.AITenantNamespace == "" {
@@ -504,7 +514,7 @@ func (r *LifecycleReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			builder.WithPredicates(cfgSingleton),
 		).
 		Watches(
-			&maasv1alpha1.Tenant{},
+			&maasv1alpha1.MaasTenantConfig{},
 			handler.EnqueueRequestsFromMapFunc(func(_ context.Context, _ client.Object) []reconcile.Request {
 				return []reconcile.Request{{NamespacedName: types.NamespacedName{
 					Namespace: r.DeploymentNS,

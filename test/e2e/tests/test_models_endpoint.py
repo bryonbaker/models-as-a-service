@@ -810,31 +810,61 @@ class TestModelsEndpoint:
                 check=True,
             )
 
-            # Wait for subscription to reconcile before creating API key
-            _wait_for_maas_subscription_phase(subscription_name, namespace=maas_ns)
+            # Wait for auth and subscription reconciliation before creating API key.
+            # Both modelRefs must be governed before /v1/models probes each backend.
+            _wait_for_maas_auth_policy_phase(
+                auth_policy_name,
+                namespace=maas_ns,
+                timeout=120,
+            )
+            _wait_for_maas_subscription_phase(
+                subscription_name,
+                namespace=maas_ns,
+                timeout=120,
+                require_model_statuses=True,
+            )
+            _wait_for_model_ready(MODEL_REF, namespace=MODEL_NAMESPACE)
+            _wait_for_model_ready(PREMIUM_MODEL_REF, namespace=MODEL_NAMESPACE)
 
             # Create API key bound to our test subscription
             api_key = _create_api_key(sa_token, name="e2e-diff-refs-test-key", subscription=subscription_name)
 
             _wait_reconcile()
 
-            # Query /v1/models
+            # Query /v1/models. Gateway policy propagation and backend model probes can
+            # lag behind CR readiness, so wait until both modelRefs appear.
             log.info(f"Querying /v1/models with subscription: {subscription_name}")
-            r = _get_models_with_gateway_retry(
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "x-maas-subscription": subscription_name,
-                },
-            )
+            request_headers = {
+                "Authorization": f"Bearer {api_key}",
+                "x-maas-subscription": subscription_name,
+            }
+            deadline = time.time() + 120
+            r = None
+            models = []
+            model_ids = []
+            while time.time() < deadline:
+                r = _get_models_with_gateway_retry(headers=request_headers)
+                if r.status_code == 200:
+                    models = r.json().get("data") or []
+                    assert isinstance(models, list), "Models should be a list"
+                    model_ids = [m["id"] for m in models]
+                    urls = [m.get("url") for m in models if m.get("id") == MODEL_NAME and m.get("url")]
+                    if len(models) == 2 and len(set(urls)) == 2:
+                        break
+                    log.info(
+                        "Models response not fully propagated yet; "
+                        f"got {len(models)} entries: {model_ids}"
+                    )
+                else:
+                    log.info(f"Waiting for /v1/models HTTP 200; got {r.status_code}: {r.text[:200]}")
+                time.sleep(5)
 
+            assert r is not None, "Expected /v1/models response, got none"
             assert r.status_code == 200, f"Expected 200, got {r.status_code}: {r.text}"
-            data = r.json()
-            models = data.get("data") or []
 
             assert isinstance(models, list), "Models should be a list"
 
             # Get model IDs from response
-            model_ids = [m["id"] for m in models]
             unique_ids = set(model_ids)
 
             log.info(f"📊 API Response: {len(models)} total model(s), {len(unique_ids)} unique ID(s)")
@@ -854,7 +884,7 @@ class TestModelsEndpoint:
             # INTENDED BEHAVIOR: Should return 2 entries (deduplication by model ID + URL)
             # Different backend services (different URLs) return separate entries even with same model ID
             assert len(models) == 2, \
-                f"Expected 2 entries (different URLs), got {len(models)}: {model_ids}"
+                f"Expected 2 entries (different URLs), got {len(models)}: {json.dumps(models, indent=2)}"
 
             # Validate both entries have different URLs
             urls = [m["url"] for m in models if "url" in m]

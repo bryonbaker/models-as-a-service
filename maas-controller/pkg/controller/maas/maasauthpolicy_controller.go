@@ -54,11 +54,11 @@ import (
 type MaaSAuthPolicyReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
-	// MaaSAPINamespace is the namespace where maas-api service is deployed.
+	// InfraNamespace is the infrastructure namespace where maas-api service is deployed.
 	// Used to construct the subscription selector endpoint URL.
-	MaaSAPINamespace string
+	InfraNamespace string
 
-	// TenantNamespace is the namespace where the Tenant CR lives (configurable via flags).
+	// TenantNamespace is the namespace where the default MaasTenantConfig CR lives (configurable via flags).
 	// Defaults to "models-as-a-service".
 	TenantNamespace string
 
@@ -86,10 +86,11 @@ type MaaSAuthPolicyReconciler struct {
 	Recorder record.EventRecorder
 }
 
-// oidcConfig holds OIDC configuration from Tenant CR
+// oidcConfig holds resolved OIDC configuration from AITenant or a legacy Tenant CR.
 type oidcConfig struct {
 	IssuerURL string
 	ClientID  string
+	TTL       int
 }
 
 // authzCacheTTL returns the safe TTL for authorization caches that depend on metadata.
@@ -114,34 +115,29 @@ func (r *MaaSAuthPolicyReconciler) authzCacheTTL() int64 {
 	return metadata
 }
 
-// fetchTenantIdentifier fetches the tenant identifier from the Tenant CR in the given namespace.
-// The missing-Tenant fallback preserves legacy default-tenant behavior; malformed
-// AITenant-managed Tenant metadata returns an error so callers do not collide with
+// fetchTenantIdentifier fetches the tenant identifier from the tenant config in the given namespace.
+// The missing-config fallback preserves legacy default-tenant behavior; malformed
+// AITenant-managed metadata returns an error so callers do not collide with
 // the legacy/default resource names.
 func (r *MaaSAuthPolicyReconciler) fetchTenantIdentifier(ctx context.Context, log logr.Logger, policyNamespace string) (string, error) {
-	tenant := &maasv1alpha1.Tenant{}
-	tenantKey := client.ObjectKey{
-		Name:      maasv1alpha1.TenantInstanceName,
-		Namespace: policyNamespace,
-	}
-
-	if err := r.Get(ctx, tenantKey, tenant); err != nil {
+	tenant, err := fetchTenantForNamespace(ctx, r.Client, policyNamespace)
+	if err != nil {
 		if apierrors.IsNotFound(err) {
-			log.V(1).Info("Tenant not found, assuming default tenant (empty identifier)",
-				"tenantName", maasv1alpha1.TenantInstanceName,
+			log.V(1).Info("tenant config not found, assuming default tenant (empty identifier)",
+				"tenantConfigName", maasv1alpha1.MaasTenantConfigInstanceName,
 				"tenantNamespace", policyNamespace)
 			// Fallback to default tenant identifier (empty string)
 			return "", nil
 		}
-		log.Error(err, "failed to get Tenant resource",
-			"tenantName", maasv1alpha1.TenantInstanceName,
+		log.Error(err, "failed to get tenant config resource",
+			"tenantConfigName", maasv1alpha1.MaasTenantConfigInstanceName,
 			"tenantNamespace", policyNamespace)
 		return "", err
 	}
 
-	// Use TenantIdentifierFor for resource naming (maas-api service name construction).
+	// Use TenantIdentifierFor semantics for resource naming (maas-api service name construction).
 	// Returns "" for default tenant, tenantID for others.
-	tenantIdentifier, err := tenantreconcile.TenantIdentifierFor(tenant)
+	tenantIdentifier, err := tenant.identifier()
 	if err != nil {
 		log.Error(err, "failed to determine tenant identifier")
 		return "", err
@@ -152,19 +148,15 @@ func (r *MaaSAuthPolicyReconciler) fetchTenantIdentifier(ctx context.Context, lo
 }
 
 func (r *MaaSAuthPolicyReconciler) fetchTenantPlatformContext(ctx context.Context, log logr.Logger, tenantNamespace string) (*tenantreconcile.PlatformContext, error) {
-	tenant := &maasv1alpha1.Tenant{}
-	tenantKey := client.ObjectKey{
-		Name:      maasv1alpha1.TenantInstanceName,
-		Namespace: tenantNamespace,
-	}
 	defaultTenantNamespace := r.TenantNamespace
 	if defaultTenantNamespace == "" {
 		defaultTenantNamespace = tenantreconcile.DefaultAITenantName
 	}
-	if err := r.Get(ctx, tenantKey, tenant); err != nil {
+	tenant, err := fetchTenantForNamespace(ctx, r.Client, tenantNamespace)
+	if err != nil {
 		if apimeta.IsNoMatchError(err) {
-			log.V(1).Info("Tenant CRD not installed, using default platform context",
-				"tenantName", maasv1alpha1.TenantInstanceName,
+			log.V(1).Info("tenant config CRD not installed, using default platform context",
+				"tenantConfigName", maasv1alpha1.MaasTenantConfigInstanceName,
 				"tenantNamespace", tenantNamespace)
 			platformContext := tenantreconcile.PlatformContext{
 				GatewayRef: fallbackTenantGatewayRef(r.GatewayName, r.GatewayNamespace),
@@ -174,8 +166,8 @@ func (r *MaaSAuthPolicyReconciler) fetchTenantPlatformContext(ctx context.Contex
 		}
 		if apierrors.IsNotFound(err) {
 			if !r.TenantNamespaceDiscoveryEnabled || tenantNamespace == defaultTenantNamespace {
-				log.V(1).Info("Tenant not found in default namespace, using default platform context",
-					"tenantName", maasv1alpha1.TenantInstanceName,
+				log.V(1).Info("tenant config not found in default namespace, using default platform context",
+					"tenantConfigName", maasv1alpha1.MaasTenantConfigInstanceName,
 					"tenantNamespace", tenantNamespace)
 				platformContext := tenantreconcile.PlatformContext{
 					GatewayRef: fallbackTenantGatewayRef(r.GatewayName, r.GatewayNamespace),
@@ -188,7 +180,7 @@ func (r *MaaSAuthPolicyReconciler) fetchTenantPlatformContext(ctx context.Contex
 				return nil, allowErr
 			}
 			if allowed {
-				return nil, fmt.Errorf("tenant %s/%s not found; refusing to use default platform context for discovered tenant namespace", tenantNamespace, maasv1alpha1.TenantInstanceName)
+				return nil, fmt.Errorf("MaasTenantConfig %s/%s not found; refusing to use default platform context for discovered tenant namespace", tenantNamespace, maasv1alpha1.MaasTenantConfigInstanceName)
 			}
 			platformContext := tenantreconcile.PlatformContext{
 				GatewayRef: fallbackTenantGatewayRef(r.GatewayName, r.GatewayNamespace),
@@ -196,10 +188,14 @@ func (r *MaaSAuthPolicyReconciler) fetchTenantPlatformContext(ctx context.Contex
 			}
 			return &platformContext, nil
 		}
-		return nil, fmt.Errorf("failed to get Tenant CR: %w", err)
+		return nil, fmt.Errorf("failed to get tenant config CR: %w", err)
 	}
 
-	platformContext, err := tenantreconcile.ResolvePlatformContext(ctx, r.Client, tenant, fallbackTenantGatewayRef(r.GatewayName, r.GatewayNamespace))
+	platformContext, err := tenant.platformContext(
+		ctx,
+		r.Client,
+		fallbackTenantGatewayRef(r.GatewayName, r.GatewayNamespace),
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -234,14 +230,33 @@ func (r *MaaSAuthPolicyReconciler) fetchOIDCConfig(ctx context.Context, log logr
 		return nil
 	}
 
+	const (
+		defaultOIDCJWKSTTL = 300
+		minOIDCJWKSTTL     = 30
+	)
+
+	ttl := oidc.TTL
+	switch {
+	case ttl == 0:
+		ttl = defaultOIDCJWKSTTL
+	case ttl < minOIDCJWKSTTL:
+		log.Error(nil, "Tenant external OIDC ttl below minimum, rejecting OIDC config",
+			"ttl", ttl,
+			"minimum", minOIDCJWKSTTL,
+			"source", platformContext.Source)
+		return nil
+	}
+
 	log.Info("OIDC configuration loaded from tenant platform context",
 		"issuerUrl", oidc.IssuerURL,
 		"clientId", oidc.ClientID,
+		"ttl", ttl,
 		"source", platformContext.Source)
 
 	return &oidcConfig{
 		IssuerURL: oidc.IssuerURL,
 		ClientID:  oidc.ClientID,
+		TTL:       ttl,
 	}
 }
 
@@ -370,6 +385,7 @@ func subscriptionGatewayCacheKeySelector() string {
 //+kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=httproutes,verbs=get;list;watch
 //+kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=gateways,verbs=get;list;watch
 //+kubebuilder:rbac:groups=config.openshift.io,resources=authentications,verbs=get
+//+kubebuilder:rbac:groups=maas.opendatahub.io,resources=maastenantconfigs,verbs=get;list;watch
 //+kubebuilder:rbac:groups=maas.opendatahub.io,resources=tenants,verbs=get;list;watch
 //+kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 //+kubebuilder:rbac:groups=inference.opendatahub.io,resources=externalmodels,verbs=list
@@ -459,12 +475,12 @@ func (r *MaaSAuthPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	// In multi-tenant mode: creates AuthPolicy for each tenant's gateway.
 	//
 	// Skip reconciling if this is a non-default tenant using the default gateway.
-	// This happens when a Tenant CR exists without a gatewayRef - it shouldn't
-	// overwrite the default gateway's AuthPolicy with tenant-specific configuration.
+	// This should not overwrite the default gateway's AuthPolicy with
+	// tenant-specific configuration.
 	isDefaultGateway := gatewayNs == r.GatewayNamespace && gatewayName == r.GatewayName
 	isNonDefaultTenant := tenantID != ""
 	if isNonDefaultTenant && isDefaultGateway {
-		log.Info("skipping gateway AuthPolicy reconciliation: non-default tenant falling back to default gateway (Tenant CR missing gatewayRef)",
+		log.Info("skipping gateway AuthPolicy reconciliation: non-default tenant falling back to default gateway",
 			"tenantID", tenantID,
 			"tenantNamespace", req.Namespace,
 			"gatewayNamespace", gatewayNs,
@@ -614,8 +630,8 @@ func (r *MaaSAuthPolicyReconciler) buildGatewayAuthPolicySpec(modelAccessJSON st
 		maasAPIServiceName = fmt.Sprintf("maas-api-%s", tenantID)
 	}
 
-	apiKeyValidationURL := fmt.Sprintf("https://%s.%s.svc.cluster.local:8443/internal/v1/api-keys/validate", maasAPIServiceName, r.MaaSAPINamespace)
-	subscriptionSelectorURL := fmt.Sprintf("https://%s.%s.svc.cluster.local:8443/internal/v1/subscriptions/select", maasAPIServiceName, r.MaaSAPINamespace)
+	apiKeyValidationURL := fmt.Sprintf("https://%s.%s.svc.cluster.local:8443/internal/v1/api-keys/validate", maasAPIServiceName, r.InfraNamespace)
+	subscriptionSelectorURL := fmt.Sprintf("https://%s.%s.svc.cluster.local:8443/internal/v1/subscriptions/select", maasAPIServiceName, r.InfraNamespace)
 
 	// subscription-info body: same fields as per-model, but requestedModel uses dynamic CEL
 	subscriptionInfoBody := fmt.Sprintf(`{
@@ -675,7 +691,7 @@ func (r *MaaSAuthPolicyReconciler) buildGatewayAuthPolicySpec(modelAccessJSON st
 		authenticationRules["oidc-identities"] = map[string]any{
 			"jwt": map[string]any{
 				"issuerUrl": oidc.IssuerURL,
-				"ttl":       int64(300),
+				"ttl":       int64(oidc.TTL),
 			},
 			"when": []any{
 				map[string]any{
@@ -846,6 +862,30 @@ allow {
 allow {
 	count(unsafe_group) == 0
 }`,
+			},
+		}
+		// oidc-client-bound enforces that OIDC JWTs were issued to the configured
+		// OAuth client (azp claim). The has(auth.identity.azp) guard is required so
+		// that OpenShift TokenReview identities (which carry no azp claim) are not
+		// matched by this rule and denied with 403.
+		authorizationRules["oidc-client-bound"] = map[string]any{
+			"when": []any{
+				map[string]any{
+					"predicate": celIsNotAPIKey +
+						` && request.headers.authorization.matches("^Bearer [^.]+\\.[^.]+\\.[^.]+$")` +
+						` && has(auth.identity.azp)`,
+				},
+			},
+			"metrics":  false,
+			"priority": int64(1),
+			"patternMatching": map[string]any{
+				"patterns": []any{
+					map[string]any{
+						"selector": "auth.identity.azp",
+						"operator": "eq",
+						"value":    oidc.ClientID,
+					},
+				},
 			},
 		}
 	}
